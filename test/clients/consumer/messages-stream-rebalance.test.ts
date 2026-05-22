@@ -13,7 +13,7 @@ import {
   MessagesStreamModes,
   ResponseError
 } from '../../../src/index.ts'
-import { kGetFetchNode } from '../../../src/symbols.ts'
+import { kAutocommit, kGetFetchNode } from '../../../src/symbols.ts'
 import { createConsumer, mockConnectionPoolGet, mockMetadata, mockMethod } from '../../helpers.ts'
 
 const topic = 'test-topic'
@@ -601,6 +601,41 @@ test('should refresh fallback offsets when offset out of range fetch errors omit
   strictEqual(recoveredOffsets[0], 5n)
   strictEqual(listOffsetRequests.at(-1).timestamp, ListOffsetTimestamps.EARLIEST)
   strictEqual(listOffsetRequests.at(-1).partitions[topic][0], 0)
+
+  stream.destroy()
+})
+
+test('autocommit callback should wait for commit completion', async t => {
+  const consumer = createConsumerMock(t, (_options, _callback) => {})
+  const stream = createStream(consumer)
+  let commitFinished = false
+  let callbackCalled = false
+
+  t.mock.method(consumer, 'commit', (_options: unknown, callback: CallbackWithPromise<void>) => {
+    setTimeout(() => {
+      commitFinished = true
+      callback(null)
+    }, 20)
+  })
+
+  stream.offsetsToCommit.set(`${topic}:0`, { topic, partition: 0, offset: 10n, leaderEpoch: 0 })
+
+  const autocommitFinished = new Promise<void>((resolve, reject) => {
+    stream[kAutocommit](error => {
+      callbackCalled = true
+      if (error) {
+        reject(error)
+        return
+      }
+
+      strictEqual(commitFinished, true)
+      resolve()
+    })
+  })
+
+  strictEqual(callbackCalled, false)
+  await autocommitFinished
+  strictEqual(callbackCalled, true)
 
   stream.destroy()
 })
