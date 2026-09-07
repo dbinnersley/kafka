@@ -44,31 +44,94 @@ export function roundRobinAssigner (
   return assignments
 }
 
-export function cooperativeStickyAssigner (
-  _current: string,
-  members: Map<string, ExtendedGroupProtocolSubscription>,
-  topics: Set<string>,
-  metadata: ClusterMetadata
-): GroupPartitionsAssignments[] {
-  const assignments = createEmptyAssignments(members)
-  const allPartitions = listAssignablePartitions(members, topics, metadata)
-  const { owners: previousOwners, contested: contestedPreviousOwners } = previousOwnership(members, allPartitions)
+function topicPartitionKey ({ topic, partition }: TopicPartition): string {
+  return `${topic}:${partition}`
+}
 
-  for (const partition of allPartitions) {
-    const owner = previousOwners.get(topicPartitionKey(partition))
-    if (owner) {
-      addAssignment(assignments, owner, partition)
+function parseTopicPartitionKey (key: string): TopicPartition {
+  const index = key.lastIndexOf(':')
+  return {
+    topic: key.slice(0, index),
+    partition: Number(key.slice(index + 1))
+  }
+}
+
+function compareTopicPartitions (left: TopicPartition, right: TopicPartition): number {
+  const topicComparison = left.topic.localeCompare(right.topic)
+  return topicComparison === 0 ? left.partition - right.partition : topicComparison
+}
+
+function flattenAssignments (assignments: { topic: string; partitions: number[] }[]): TopicPartition[] {
+  const partitions: TopicPartition[] = []
+
+  for (const assignment of assignments) {
+    for (const partition of assignment.partitions) {
+      partitions.push({ topic: assignment.topic, partition })
     }
   }
 
-  assignUnassignedPartitions(assignments, members, allPartitions)
-  balanceAssignments(assignments, members)
-  adjustCooperativeTransfers(assignments, members, previousOwners, contestedPreviousOwners)
+  return partitions
+}
 
-  return Array.from(assignments, ([memberId, memberAssignments]) => ({
-    memberId,
-    assignments: memberAssignments
-  }))
+function assignmentSize (assignments: Map<string, { topic: string; partitions: number[] }>): number {
+  let size = 0
+  for (const assignment of assignments.values()) {
+    size += assignment.partitions.length
+  }
+  return size
+}
+
+function sortedMemberIds (assignments: Map<string, Map<string, { topic: string; partitions: number[] }>>): string[] {
+  return [...assignments.keys()].sort()
+}
+
+function assignedPartitionKeys (
+  assignments: Map<string, Map<string, { topic: string; partitions: number[] }>>
+): Set<string> {
+  const assigned = new Set<string>()
+
+  for (const memberAssignments of assignments.values()) {
+    for (const partition of flattenAssignments(Array.from(memberAssignments.values()))) {
+      assigned.add(topicPartitionKey(partition))
+    }
+  }
+
+  return assigned
+}
+
+function addAssignment (
+  assignments: Map<string, Map<string, { topic: string; partitions: number[] }>>,
+  memberId: string,
+  partition: TopicPartition
+): void {
+  const memberAssignments = assignments.get(memberId)!
+  let topicAssignment = memberAssignments.get(partition.topic)
+  if (!topicAssignment) {
+    topicAssignment = { topic: partition.topic, partitions: [] }
+    memberAssignments.set(partition.topic, topicAssignment)
+  }
+
+  if (!topicAssignment.partitions.includes(partition.partition)) {
+    topicAssignment.partitions.push(partition.partition)
+    topicAssignment.partitions.sort((a, b) => a - b)
+  }
+}
+
+function removeAssignment (
+  assignments: Map<string, Map<string, { topic: string; partitions: number[] }>>,
+  memberId: string,
+  partition: TopicPartition
+): void {
+  const memberAssignments = assignments.get(memberId)
+  const topicAssignment = memberAssignments?.get(partition.topic)
+  if (!topicAssignment) {
+    return
+  }
+
+  topicAssignment.partitions = topicAssignment.partitions.filter(current => current !== partition.partition)
+  if (topicAssignment.partitions.length === 0) {
+    memberAssignments!.delete(partition.topic)
+  }
 }
 
 function createEmptyAssignments (
@@ -81,6 +144,16 @@ function createEmptyAssignments (
   }
 
   return assignments
+}
+
+function hasEligibleMember (members: Map<string, ExtendedGroupProtocolSubscription>, topic: string): boolean {
+  for (const member of members.values()) {
+    if (member.topics?.includes(topic)) {
+      return true
+    }
+  }
+
+  return false
 }
 
 function listAssignablePartitions (
@@ -102,16 +175,6 @@ function listAssignablePartitions (
   }
 
   return result
-}
-
-function hasEligibleMember (members: Map<string, ExtendedGroupProtocolSubscription>, topic: string): boolean {
-  for (const member of members.values()) {
-    if (member.topics?.includes(topic)) {
-      return true
-    }
-  }
-
-  return false
 }
 
 function previousOwnership (
@@ -166,6 +229,45 @@ function previousOwnership (
   }
 
   return { owners, contested }
+}
+
+function leastLoadedEligibleMember (
+  assignments: Map<string, Map<string, { topic: string; partitions: number[] }>>,
+  members: Map<string, ExtendedGroupProtocolSubscription>,
+  partition: TopicPartition
+): string | null {
+  let selected: string | null = null
+  let selectedSize = Number.POSITIVE_INFINITY
+
+  for (const memberId of sortedMemberIds(assignments)) {
+    const member = members.get(memberId)!
+    if (!member.topics?.includes(partition.topic)) {
+      continue
+    }
+
+    const size = assignmentSize(assignments.get(memberId)!)
+    if (size < selectedSize) {
+      selected = memberId
+      selectedSize = size
+    }
+  }
+
+  return selected
+}
+
+function removablePartition (
+  assignments: Map<string, { topic: string; partitions: number[] }>,
+  targetMember: ExtendedGroupProtocolSubscription
+): TopicPartition | null {
+  const partitions = flattenAssignments(Array.from(assignments.values())).sort(compareTopicPartitions)
+
+  for (const partition of partitions) {
+    if (targetMember.topics?.includes(partition.topic)) {
+      return partition
+    }
+  }
+
+  return null
 }
 
 function assignUnassignedPartitions (
@@ -279,131 +381,29 @@ function adjustCooperativeTransfers (
   }
 }
 
-function leastLoadedEligibleMember (
-  assignments: Map<string, Map<string, { topic: string; partitions: number[] }>>,
+export function cooperativeStickyAssigner (
+  _current: string,
   members: Map<string, ExtendedGroupProtocolSubscription>,
-  partition: TopicPartition
-): string | null {
-  let selected: string | null = null
-  let selectedSize = Number.POSITIVE_INFINITY
+  topics: Set<string>,
+  metadata: ClusterMetadata
+): GroupPartitionsAssignments[] {
+  const assignments = createEmptyAssignments(members)
+  const allPartitions = listAssignablePartitions(members, topics, metadata)
+  const { owners: previousOwners, contested: contestedPreviousOwners } = previousOwnership(members, allPartitions)
 
-  for (const memberId of sortedMemberIds(assignments)) {
-    const member = members.get(memberId)!
-    if (!member.topics?.includes(partition.topic)) {
-      continue
-    }
-
-    const size = assignmentSize(assignments.get(memberId)!)
-    if (size < selectedSize) {
-      selected = memberId
-      selectedSize = size
+  for (const partition of allPartitions) {
+    const owner = previousOwners.get(topicPartitionKey(partition))
+    if (owner) {
+      addAssignment(assignments, owner, partition)
     }
   }
 
-  return selected
-}
+  assignUnassignedPartitions(assignments, members, allPartitions)
+  balanceAssignments(assignments, members)
+  adjustCooperativeTransfers(assignments, members, previousOwners, contestedPreviousOwners)
 
-function removablePartition (
-  assignments: Map<string, { topic: string; partitions: number[] }>,
-  targetMember: ExtendedGroupProtocolSubscription
-): TopicPartition | null {
-  const partitions = flattenAssignments(Array.from(assignments.values())).sort(compareTopicPartitions)
-
-  for (const partition of partitions) {
-    if (targetMember.topics?.includes(partition.topic)) {
-      return partition
-    }
-  }
-
-  return null
-}
-
-function addAssignment (
-  assignments: Map<string, Map<string, { topic: string; partitions: number[] }>>,
-  memberId: string,
-  partition: TopicPartition
-): void {
-  const memberAssignments = assignments.get(memberId)!
-  let topicAssignment = memberAssignments.get(partition.topic)
-  if (!topicAssignment) {
-    topicAssignment = { topic: partition.topic, partitions: [] }
-    memberAssignments.set(partition.topic, topicAssignment)
-  }
-
-  if (!topicAssignment.partitions.includes(partition.partition)) {
-    topicAssignment.partitions.push(partition.partition)
-    topicAssignment.partitions.sort((a, b) => a - b)
-  }
-}
-
-function removeAssignment (
-  assignments: Map<string, Map<string, { topic: string; partitions: number[] }>>,
-  memberId: string,
-  partition: TopicPartition
-): void {
-  const memberAssignments = assignments.get(memberId)
-  const topicAssignment = memberAssignments?.get(partition.topic)
-  if (!topicAssignment) {
-    return
-  }
-
-  topicAssignment.partitions = topicAssignment.partitions.filter(current => current !== partition.partition)
-  if (topicAssignment.partitions.length === 0) {
-    memberAssignments!.delete(partition.topic)
-  }
-}
-
-function assignedPartitionKeys (
-  assignments: Map<string, Map<string, { topic: string; partitions: number[] }>>
-): Set<string> {
-  const assigned = new Set<string>()
-
-  for (const memberAssignments of assignments.values()) {
-    for (const partition of flattenAssignments(Array.from(memberAssignments.values()))) {
-      assigned.add(topicPartitionKey(partition))
-    }
-  }
-
-  return assigned
-}
-
-function flattenAssignments (assignments: { topic: string; partitions: number[] }[]): TopicPartition[] {
-  const partitions: TopicPartition[] = []
-
-  for (const assignment of assignments) {
-    for (const partition of assignment.partitions) {
-      partitions.push({ topic: assignment.topic, partition })
-    }
-  }
-
-  return partitions
-}
-
-function assignmentSize (assignments: Map<string, { topic: string; partitions: number[] }>): number {
-  let size = 0
-  for (const assignment of assignments.values()) {
-    size += assignment.partitions.length
-  }
-  return size
-}
-
-function sortedMemberIds (assignments: Map<string, Map<string, { topic: string; partitions: number[] }>>): string[] {
-  return [...assignments.keys()].sort()
-}
-
-function topicPartitionKey ({ topic, partition }: TopicPartition): string {
-  return `${topic}:${partition}`
-}
-
-function parseTopicPartitionKey (key: string): TopicPartition {
-  const index = key.lastIndexOf(':')
-  return {
-    topic: key.slice(0, index),
-    partition: Number(key.slice(index + 1))
-  }
-}
-
-function compareTopicPartitions (left: TopicPartition, right: TopicPartition): number {
-  const topicComparison = left.topic.localeCompare(right.topic)
-  return topicComparison === 0 ? left.partition - right.partition : topicComparison
+  return Array.from(assignments, ([memberId, memberAssignments]) => ({
+    memberId,
+    assignments: memberAssignments
+  }))
 }
