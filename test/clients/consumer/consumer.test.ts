@@ -5268,6 +5268,13 @@ test('cooperative sticky rebalance should continue when autocommit fails', async
     return originalCommit(options, callback)
   })
 
+  // With `autocommit: true` and no interval, the stream commits after every fetch cycle, so the
+  // offsets consumed above are usually already flushed by the time the rebalance starts. The
+  // revoke round would then find nothing to commit, never call the mock, and never emit
+  // `consumer:group:autocommit:error` — leaving the awaits below hanging. Seed a pending offset
+  // so the commit issued during the revoke is guaranteed to happen, and to fail.
+  stream1.offsetsToCommit.set(`${topic}:0`, { topic, partition: 0, offset: 1n, leaderEpoch: 0 })
+
   const autocommitErrorPromise = once(consumer1, 'consumer:group:autocommit:error')
   const consumer2 = createConsumer(t, { groupId, protocols })
   await consumer2.topics.trackAll(topic)
