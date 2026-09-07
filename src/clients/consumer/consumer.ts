@@ -2219,10 +2219,18 @@ export class Consumer<Key = Buffer, Value = Buffer, HeaderKey = Buffer, HeaderVa
           stream.pause()
         }
 
+        // Snapshot the set: a failing autocommit destroys its stream, which removes it from
+        // #streams while the concurrent callbacks are still iterating.
         runConcurrentCallbacks(
           'Autocommit before cooperative rebalance failed.',
-          this.#streams,
+          [...this.#streams],
           (stream, concurrentCallback) => {
+            // A destroyed stream never settles an autocommit, so do not wait on one.
+            if (stream.destroyed || stream.closed) {
+              concurrentCallback(null)
+              return
+            }
+
             stream[kAutocommit](concurrentCallback)
           },
           autocommitError => {

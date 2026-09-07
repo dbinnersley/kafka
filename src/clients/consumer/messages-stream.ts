@@ -1120,7 +1120,23 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
     // starting a second one, so a cooperative rebalance waits for the in-flight
     // commit instead of proceeding as if nothing was pending.
     if (this.#autocommitInflight) {
-      callback && this.once('autocommit', error => callback(error))
+      if (callback) {
+        // A commit which fails with a rejoin-required error destroys the stream, and a destroyed
+        // stream never emits 'autocommit' again. Settle on whichever comes first so an awaiting
+        // rebalance cannot deadlock on a stream that is going away.
+        const onAutocommit = (error: Error | null): void => {
+          this.removeListener('close', onClose)
+          callback(error)
+        }
+        const onClose = (): void => {
+          this.removeListener('autocommit', onAutocommit)
+          callback(null)
+        }
+
+        this.once('autocommit', onAutocommit)
+        this.once('close', onClose)
+      }
+
       return
     }
 

@@ -11,6 +11,7 @@ import {
   MessagesStream,
   MessagesStreamFallbackModes,
   MessagesStreamModes,
+  ProtocolError,
   ResponseError
 } from '../../../src/index.ts'
 import { kAutocommit, kGetFetchNode } from '../../../src/symbols.ts'
@@ -638,6 +639,39 @@ test('autocommit callback should wait for commit completion', async t => {
   strictEqual(callbackCalled, true)
 
   stream.destroy()
+})
+
+test('autocommit callback should settle when an inflight commit destroys the stream', async t => {
+  const consumer = createConsumerMock(t, (_options, _callback) => {})
+  const stream = createStream(consumer)
+
+  // Fail the commit with a rejoin-required error: [kAutocommit] destroys the stream, which
+  // means no further 'autocommit' event is ever emitted. A caller waiting on the inflight
+  // commit must still be settled, otherwise a cooperative rebalance deadlocks here.
+  t.mock.method(consumer, 'commit', (_options: unknown, callback: CallbackWithPromise<void>) => {
+    setTimeout(() => {
+      callback(new ProtocolError('REBALANCE_IN_PROGRESS'))
+    }, 20)
+  })
+
+  stream.on('error', () => {})
+
+  stream.offsetsToCommit.set(`${topic}:0`, { topic, partition: 0, offset: 10n, leaderEpoch: 0 })
+
+  // Start the first commit, then join it while it is still inflight.
+  stream[kAutocommit](() => {})
+
+  const waiterSettled = new Promise<void>(resolve => {
+    stream[kAutocommit](() => {
+      resolve()
+    })
+  })
+
+  const timeout = new Promise<never>((_resolve, reject) => {
+    setTimeout(() => reject(new Error('autocommit callback never settled')), 1_000).unref()
+  })
+
+  await Promise.race([waiterSettled, timeout])
 })
 
 test('should route follow-up fetches to preferred read replicas', async t => {
